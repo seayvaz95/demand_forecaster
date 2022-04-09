@@ -1,0 +1,108 @@
+import pandas as pd
+import calendar
+import scipy.stats
+import numpy as np
+
+from statsmodels.tsa.stattools import pacf
+from collections import Counter
+from sklearn.cluster import KMeans
+
+from sqlalchemy import create_engine
+
+engine = create_engine('postgresql://postgres:password@localhost:5434/postgres')
+
+df = pd.read_sql_query('select * from daily_sales', con=engine)
+product_info = pd.read_sql_query('select * from product_info', con=engine)
+brand_segment_info = pd.read_sql_query('select * from brand_segment_info', con=engine)
+activity_calendar = pd.read_sql_query('select * from activity_calendar', con=engine)
+
+forecast_start_date = '2021-09-01'
+
+def get_metadata(data):
+    return data.merge(product_info.merge(brand_segment_info, on='Marka'), on=[sku_code_col, sku_name_col])
+
+def get_month_and_year_and_days(data):
+    data[date_col] = data[date_col].astype('datetime64[D]')
+    data["month"] = data[date_col].dt.month
+    data["year"] = data[date_col].dt.year
+    data["dayOfMonth"] = data[date_col].dt.day
+    data["dayOfWeek"] = data[date_col].dt.weekday
+    return data
+
+def rm_outliers(data, target_col, threshold=3.0):
+    z_scores = scipy.stats.zscore(data[target_col])
+    abs_z_scores = np.abs(z_scores)
+    data['zscore'] = abs_z_scores
+    data.loc[data["zscore"]>threshold, target_col] = np.nan
+    data=data.fillna(method="ffill")
+    return data.drop("zscore",axis=1)
+
+def rm_pr_w_few_sales(data, threshold=20):
+    sums = data.groupby([sku_code_col]).sum()
+    valid_skus = sums[sums[sales_quantity_col]>threshold].index
+    data = data[data[sku_code_col].isin(valid_skus)]
+    return data
+
+def get_cat_stats(data, col, shift_window, rolling_window):
+    k = data[[col, sales_quantity_col, date_col]].groupby([date_col, col]).sum().reset_index().sort_values([col, date_col])
+    mean = pd.concat([k.groupby(col).shift(shift_window).rolling(rolling_window).mean().fillna(method="bfill").pct_change().fillna(method="bfill"), k[[col, date_col]]],axis=1).rename(columns={sales_quantity_col:"{}_{}_mean".format(col.lower(), shift_window)})
+    data = data.merge(mean, on=[col, date_col], how="left")
+    return data
+
+def get_lags(data, threshold=0.65, num_lags=5, opt_lags=None):
+    lags = []
+    for sku in data[sku_code_col].unique().tolist():
+        try:
+            lags.extend(np.where(pacf(data[(data[sku_code_col]==sku)&(data[date_col]<forecast_start_date)].sort_values([date_col])[sales_quantity_col].values)>threshold)[0].tolist())
+        except:
+            pass
+    lag_vals = [x[0] for x in Counter(lags).most_common(num_lags) if x[0]!=0]
+    if opt_lags is not None:
+        lag_vals.extend(opt_lags)
+    for i in lag_vals:
+        data['demand_lag_{}'.format(i)] = data.groupby([sku_code_col])[sales_quantity_col].shift(i).fillna(method='bfill')
+    return data
+
+def get_volume_cluster_labels(data, num_k):
+    df_means = data[data[date_col]<forecast_start_date].groupby(sku_code_col).agg({sales_quantity_col: "mean"})
+    #q_range = np.array([0,0.11,0.25,0.44,0.55,0.7,0.8,0.98,1])
+    #df_means["Volume_Cluster"] = pd.qcut(df_means[sales_quantity_col].values, q_range, labels=np.arange(q_range.shape[0]-1), duplicates='drop')
+    model = KMeans(num_k, max_iter=10000, random_state=0)
+    df_means["volume_cluster"] = model.fit_predict(df_means) 
+    data = pd.merge(data, df_means["volume_cluster"], left_on=sku_code_col, right_index=True, how="left")
+    data.loc[data['volume_cluster'].isnull(), 'volume_cluster'] = data['volume_cluster'].max()
+    return data
+
+def get_campaign_sales_stats(data, stat):
+    temp = getattr(data[data[date_col]<forecast_start_date].groupby([sku_code_col, sales_type_col]), stat)()
+    camp_sales = temp[sales_quantity_col].reset_index().rename(columns={sales_quantity_col:'campaign_{}'.format(stat)})
+    data = data.merge(camp_sales, on=[sku_code_col, sales_type_col], how='left')
+    data['campaign_{}'.format(stat)] = data['campaign_{}'.format(stat)].fillna(data['demand_lag_30'])
+    return data
+
+def get_price_change(data):
+    data['price_pc_change'] = data.sort_values([sku_code_col, date_col]).reset_index(drop=True)[[sku_code_col, unit_price_col]].groupby(sku_code_col).pct_change().fillna(method="bfill")
+    return data
+
+df = get_month_and_year_and_days(df)
+df = get_metadata(df)
+df.loc[df[date_col]<forecast_start_date] = df.loc[df[date_col]<forecast_start_date].groupby(sku_code_col).apply(lambda x: rm_outliers(x, sales_quantity_col, threshold=2.0))
+df = rm_pr_w_few_sales(df)
+
+df = get_cat_stats(df, 'Segment', 1, 7)
+df = get_cat_stats(df, 'Segment', 15, 7)
+df = get_lags(df, opt_lags=[14, 15, 30])
+df = get_volume_cluster_labels(df, 8)
+df = get_price_change(df)
+df = get_campaign_sales_stats(df, 'mean')
+df = get_campaign_sales_stats(df, 'max')
+
+df['is_campaign'] = df.apply(lambda x: 1 if x[sales_type_col]!='No Discount' else 0, axis=1)
+
+df = df.sort_values([date_col, sku_code_col]).reset_index(drop=True)
+
+train_data = df[df['date_col']<forecast_start_date]
+test_data = df[df['date_col']>=forecast_start_date]
+
+
+    
